@@ -5,3 +5,4 @@ models/
 *.part
 gputune.csv
 gputune.ini
+release/

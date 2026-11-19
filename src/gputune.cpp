@@ -296,7 +296,7 @@ void paintGraph(HDC dc, RECT rc) {
     SelectObject(dc, axis); MoveToEx(dc, pl.left, pl.top, nullptr); LineTo(dc, pl.left, pl.bottom); LineTo(dc, pl.right, pl.bottom);
     TextOutW(dc, pl.left + (pl.right - pl.left) / 2 - 120, rc.bottom - 24, L"VRAM clock under load (MHz, measured)", 37);
     TextOutW(dc, pl.left - 60, pl.top - 24, L"tok/s", 5);
-    if (pts.empty()) { SetTextColor(dc, RGB(130, 130, 130)); TextOutW(dc, pl.left + 40, (pl.top + pl.bottom) / 2 - 8, L"Move the slider and press TEST: every test adds a dot.", 53); }
+    if (pts.empty()) { SetTextColor(dc, RGB(130, 130, 130)); TextOutW(dc, pl.left + 40, (pl.top + pl.bottom) / 2 - 8, L"Move the slider and press TEST: every test adds a dot.", 54); }
     std::vector<const Pt*> s = pts; std::sort(s.begin(), s.end(), [](const Pt* a, const Pt* b) { return a->mem < b->mem; });
     HPEN line = CreatePen(PS_SOLID, 2, RGB(150, 190, 235)); SelectObject(dc, line);
     for (size_t i = 0; i < s.size(); i++) { if (i == 0) MoveToEx(dc, X(s[i]->mem), Y(s[i]->tps), nullptr); else LineTo(dc, X(s[i]->mem), Y(s[i]->tps)); }
@@ -307,9 +307,12 @@ void paintGraph(HDC dc, RECT rc) {
         SelectObject(dc, br); SelectObject(dc, pn); const int r = isBest ? 8 : 6;
         Ellipse(dc, X(p.mem) - r, Y(p.tps) - r, X(p.mem) + r, Y(p.tps) + r);
         SelectObject(dc, old); DeleteObject(br); DeleteObject(pn);
+        bool crowded = false;                                                  // a dot that sits on top of an earlier one gets no label (the list has every value)
+        for (size_t j = 0; j < i; j++) if (std::abs(X(pts[j]->mem) - X(p.mem)) < 80 && std::abs(Y(pts[j]->tps) - Y(p.tps)) < 36) crowded = true;
+        if (crowded && !isBest) continue;
         wchar_t t[64]; swprintf(t, 64, L"%+d  (%.1f)", p.off, p.tps); wchar_t t2[40]; swprintf(t2, 40, L"core %.0f", p.sm);
         SetTextColor(dc, isBest ? RGB(20, 120, 50) : RGB(60, 60, 60)); TextOutW(dc, X(p.mem) - 28, Y(p.tps) - 26, t, (int)wcslen(t));
-        SetTextColor(dc, RGB(130, 130, 130)); TextOutW(dc, X(p.mem) - 22, Y(p.tps) + 10, t2, (int)wcslen(t2));
+        if (!crowded) { SetTextColor(dc, RGB(130, 130, 130)); TextOutW(dc, X(p.mem) - 22, Y(p.tps) + 10, t2, (int)wcslen(t2)); }
     }
     SelectObject(dc, old); DeleteObject(grid); DeleteObject(axis); DeleteObject(line);
 }
@@ -363,10 +366,10 @@ void layout() {
     MoveWindow(g_list, W - 420, 10, 410, H - bottom - 10, TRUE);
     const int y0 = H - bottom + 6;
     MoveWindow(g_modelLabel, 14, y0 + 4, 80, 22, TRUE);
-    MoveWindow(g_combo, 96, y0, 470, 300, TRUE);
-    MoveWindow(g_dl, 574, y0 - 1, 150, 28, TRUE);
-    MoveWindow(g_browse, 730, y0 - 1, 100, 28, TRUE);
-    MoveWindow(g_prog, 838, y0 + 2, std::max(60, W - 852), 22, TRUE);
+    MoveWindow(g_combo, 96, y0, 540, 300, TRUE);
+    MoveWindow(g_dl, 644, y0 - 1, 150, 28, TRUE);
+    MoveWindow(g_browse, 800, y0 - 1, 100, 28, TRUE);
+    MoveWindow(g_prog, 908, y0 + 2, std::max(60, W - 922), 22, TRUE);
     MoveWindow(g_label, 14, y0 + 42, W - 28, 22, TRUE);
     MoveWindow(g_slider, 8, y0 + 66, W - 16, 48, TRUE);
     MoveWindow(g_test, 14, y0 + 124, 130, 36, TRUE);

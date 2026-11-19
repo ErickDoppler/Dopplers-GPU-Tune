@@ -16,6 +16,18 @@ limit, so a higher memory clock can lower the GPU core boost clock. This program
 Move the slider, press TEST, repeat; the highest dot is the best combination for your card (and the core clock column
 shows what you pay for it).
 
+## Screenshots
+
+![Graph: every TEST adds a dot, the list shows core clock and power](docs/screenshot-test.png)
+
+*The graph and the list after four tests. This capture was made in the dry-run build (`GpuTune-dry.exe`, which never writes an
+offset), so the card's clock did not change and all dots sit at the same VRAM clock; with the real build the dots spread along the
+x axis as you move the slider.*
+
+![Downloading a test model](docs/screenshot-download.png)
+
+*The test model is downloaded from inside the program: progress bar, Cancel, and resume of an unfinished download.*
+
 ## Using it
 
 1. Put the **llama.cpp runtime** in `runtime\` (see `runtime\README.txt`; about 700 MB with the CUDA libraries).
@@ -59,7 +71,8 @@ The program has no dependencies besides the NVIDIA driver (`nvml.dll`) and the f
 | `runtime\` | llama.cpp runtime DLLs (not in git) |
 | `models\` | downloaded test models (not in git) |
 
-## Licence
+## License
 
-The program is free to use. llama.cpp / ggml are MIT licensed (`LICENSE-llama.cpp.txt`). The NVIDIA CUDA libraries in
+Same terms as Dopplers Bakery: **free for personal use; enterprise use requires US$100 per workstation** (see
+[LICENSE](LICENSE)). llama.cpp / ggml are MIT licensed (`LICENSE-llama.cpp.txt`). The NVIDIA CUDA libraries in
 `runtime\` are NVIDIA's and redistributable under their licence.
