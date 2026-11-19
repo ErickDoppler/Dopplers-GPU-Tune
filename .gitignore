@@ -1,0 +1,7 @@
+runtime/
+models/
+*.exe
+*.o
+*.part
+gputune.csv
+gputune.ini
