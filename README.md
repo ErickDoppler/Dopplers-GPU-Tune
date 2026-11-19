@@ -24,16 +24,16 @@ shows what you pay for it).
 offset), so the card's clock did not change and all dots sit at the same VRAM clock; with the real build the dots spread along the
 x axis as you move the slider.*
 
-![Downloading a test model](docs/screenshot-download.png)
+![The download window: CUDA libraries and test models](docs/screenshot-setup.png)
 
-*The test model is downloaded from inside the program: progress bar, Cancel, and resume of an unfinished download.*
+*The download window (first start, or the button Download...): the CUDA libraries and the test models are fetched from inside the program, with a progress bar, Cancel, and resume of an unfinished download.*
 
 ## Using it
 
-1. Put the **llama.cpp runtime** in `runtime\` (see `runtime\README.txt`; about 700 MB with the CUDA libraries).
-2. Run `GpuTune.exe` (it asks for Administrator: only an administrator can change the clock).
-3. Pick a test model and press **Download model** (resumable; the 4B model is 2.5 GB, the 1.7B model 1.1 GB), or
-   **Browse...** for any `.gguf` file. Models go to `models\`.
+1. Run `GpuTune.exe` (it asks for Administrator: only an administrator can change the clock).
+2. On the first start the **download window** opens (also with the button **Download...**): tick the **CUDA libraries** (569 MB, taken from the
+   llama.cpp release b12282 into `runtime\`) and a **test model** (resumable; the 4B model is 2.5 GB, the 1.7B model 1.1 GB; they go to `models\`),
+   and press **Download selected**. Or use **Browse...** for any `.gguf` file you already have.
 4. Move the slider and press **TEST**. The first TEST of a model also loads it (a few seconds), the next ones take
    about 5 seconds.
 
@@ -68,7 +68,7 @@ The program has no dependencies besides the NVIDIA driver (`nvml.dll`) and the f
 | `src\gputune.cpp` | the whole program (NVML, llama.cpp benchmark, downloader, window, graph) |
 | `res\` | icon (`gputune.ico`), manifests, resource scripts |
 | `include\` | llama.cpp / ggml headers (build 12282) |
-| `runtime\` | llama.cpp runtime DLLs (not in git) |
+| `runtime\` | llama.cpp runtime DLLs (not in git; the CUDA ones are downloaded by the program) |
 | `models\` | downloaded test models (not in git) |
 
 ## License

@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <commdlg.h>
+#include <shellapi.h>
 #include <tlhelp32.h>
 #include <winhttp.h>
 #include <algorithm>
@@ -152,6 +153,7 @@ const Preset kPresets[] = {
 constexpr int kPresetCount = (int)(sizeof kPresets / sizeof kPresets[0]);
 enum { WM_DONE = WM_APP + 1, WM_STATUS, WM_DLPROG, WM_DLDONE };
 std::atomic<bool> g_dlCancel{false}, g_dlBusy{false}, g_busy{false};
+std::atomic<unsigned long long> g_dlDone{0}, g_dlTotal{0};            // progress of the running download (read by the download dialog)
 HWND g_wnd;
 
 unsigned long long fileSizeOf(const std::wstring& p) { WIN32_FILE_ATTRIBUTE_DATA d; if (!GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &d)) return 0; return ((unsigned long long)d.nFileSizeHigh << 32) | d.nFileSizeLow; }
@@ -183,6 +185,7 @@ std::wstring downloadFile(const std::wstring& url, const std::wstring& dest, uns
     wchar_t lenText[32] = {}; DWORD lsz = sizeof lenText; unsigned long long len = 0;
     if (WinHttpQueryHeaders(req, WINHTTP_QUERY_CONTENT_LENGTH, nullptr, lenText, &lsz, nullptr)) len = _wcstoui64(lenText, nullptr, 10);
     const unsigned long long total = expected ? expected : have + len;
+    g_dlDone = have; g_dlTotal = total;
     HANDLE f = CreateFileW(part.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, have ? OPEN_ALWAYS : CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return L"Cannot write " + part;
     if (have) SetFilePointer(f, 0, nullptr, FILE_END); else SetEndOfFile(f);
@@ -194,7 +197,7 @@ std::wstring downloadFile(const std::wstring& url, const std::wstring& dest, uns
         DWORD wr = 0; if (!WriteFile(f, buf.data(), got, &wr, nullptr) || wr != got) { CloseHandle(f); return L"Disk write failed (disk full?)."; }
         done += got;
         auto now = std::chrono::steady_clock::now();
-        if (now - last > std::chrono::milliseconds(150)) { last = now; PostMessageW(g_wnd, WM_DLPROG, (WPARAM)(total ? done * 1000 / total : 0), (LPARAM)(done >> 20)); }
+        if (now - last > std::chrono::milliseconds(150)) { last = now; g_dlDone = done; g_dlTotal = total; }
     }
     CloseHandle(f);
     if (expected && fileSizeOf(part) != expected) return L"The file is incomplete (" + std::to_wstring(fileSizeOf(part) >> 20) + L" MB of " + std::to_wstring(expected >> 20) + L" MB). Press Download to resume.";
@@ -209,7 +212,7 @@ int g_origOff = 0; bool g_haveOrig = false, g_changed = false, g_abWarned = fals
 std::wstring g_customModel;
 
 enum { ID_SLIDER = 101, ID_TEST, ID_RESTORE, ID_CLEAR, ID_APPLY, ID_FACTOR, ID_LIST, ID_LABEL, ID_STATUS, ID_MODEL, ID_DOWNLOAD, ID_BROWSE, ID_PROGRESS, ID_FACTORTXT, ID_MODELTXT };
-HWND g_graph, g_slider, g_label, g_status, g_list, g_test, g_apply, g_factor, g_combo, g_dl, g_browse, g_prog, g_modelLabel;
+HWND g_graph, g_slider, g_label, g_status, g_list, g_test, g_apply, g_factor, g_combo, g_dl, g_browse, g_modelLabel;
 HFONT g_font, g_bold;
 
 void setStatus(const std::wstring& s) { SetWindowTextW(g_status, s.c_str()); }
@@ -235,9 +238,8 @@ void refreshCombo() {                                                      // it
 bool modelReady() { const std::wstring f = modelFile(); const int i = (int)SendMessageW(g_combo, CB_GETCURSEL, 0, 0); if (i >= 0 && i < kPresetCount) return fileSizeOf(f) == kPresets[i].bytes; return fileSizeOf(f) > 0; }
 void updateDlButton() {
     const int i = (int)SendMessageW(g_combo, CB_GETCURSEL, 0, 0);
-    SetWindowTextW(g_dl, g_dlBusy ? L"Cancel download" : L"Download model");
-    EnableWindow(g_dl, g_dlBusy || (i >= 0 && i < kPresetCount && !modelReady()));
-    EnableWindow(g_combo, !g_dlBusy);
+    SetWindowTextW(g_dl, L"Download...");
+    (void)i;
 }
 std::vector<const Pt*> visiblePts() { std::vector<const Pt*> v; const std::wstring m = baseName(modelFile()); for (auto& p : g_pts) if (p.model == m) v.push_back(&p); return v; }
 void refreshList() {
@@ -369,7 +371,6 @@ void layout() {
     MoveWindow(g_combo, 96, y0, 540, 300, TRUE);
     MoveWindow(g_dl, 644, y0 - 1, 150, 28, TRUE);
     MoveWindow(g_browse, 800, y0 - 1, 100, 28, TRUE);
-    MoveWindow(g_prog, 908, y0 + 2, std::max(60, W - 922), 22, TRUE);
     MoveWindow(g_label, 14, y0 + 42, W - 28, 22, TRUE);
     MoveWindow(g_slider, 8, y0 + 66, W - 16, 48, TRUE);
     MoveWindow(g_test, 14, y0 + 124, 130, 36, TRUE);
@@ -390,12 +391,175 @@ void saveIni() {
     WritePrivateProfileStringW(L"gputune", L"custom", g_customModel.c_str(), g_ini.c_str());
 }
 
+// ============================================================================ download dialog: CUDA libraries + test models (same idea as the one in Dopplers Bakery)
+// The CUDA libraries are not shipped in the release zip (about 600 MB): they come from the llama.cpp release the program was built against.
+const wchar_t* kLlamaTag = L"b12282";
+const unsigned long long kLlamaZipBytes = 171031017ull, kCudartZipBytes = 426314199ull;
+const wchar_t* kCudaDlls[] = {L"ggml-cuda.dll", L"cudart64_13.dll", L"cublas64_13.dll", L"cublasLt64_13.dll"};
+bool cudaInstalled() { for (const wchar_t* n : kCudaDlls) if (GetFileAttributesW((g_dir + L"\\runtime\\" + n).c_str()) == INVALID_FILE_ATTRIBUTES) return false; return true; }
+
+std::mutex g_setupMx; std::wstring g_setupText, g_setupResult; std::atomic<bool> g_setupFinished{false};
+void setupText(const std::wstring& s) { std::lock_guard<std::mutex> g(g_setupMx); g_setupText = s; }
+
+std::wstring findFileRec(const std::wstring& dir, const wchar_t* name, int depth = 4) {          // first file called name under dir
+    WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd); if (h == INVALID_HANDLE_VALUE) return L"";
+    std::vector<std::wstring> subs; std::wstring hit;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) { if (wcscmp(fd.cFileName, L".") && wcscmp(fd.cFileName, L"..")) subs.push_back(fd.cFileName); }
+        else if (_wcsicmp(fd.cFileName, name) == 0) { hit = dir + L"\\" + fd.cFileName; break; }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    if (hit.empty() && depth > 0) for (auto& s : subs) { hit = findFileRec(dir + L"\\" + s, name, depth - 1); if (!hit.empty()) break; }
+    return hit;
+}
+void removeTree(std::wstring dir) {                                                                // a folder this program made itself
+    dir.push_back(0); dir.push_back(0);
+    SHFILEOPSTRUCTW op = {}; op.wFunc = FO_DELETE; op.pFrom = dir.c_str(); op.fFlags = FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI; SHFileOperationW(&op);
+}
+bool unzipTo(const std::wstring& zip, const std::wstring& dest) {                                  // tar.exe ships with Windows 10 1803+
+    CreateDirectoryW(dest.c_str(), nullptr);
+    wchar_t sysdir[MAX_PATH]; GetSystemDirectoryW(sysdir, MAX_PATH);
+    std::wstring cl = std::wstring(L"\"") + sysdir + L"\\tar.exe\" -xf \"" + zip + L"\" -C \"" + dest + L"\"";
+    STARTUPINFOW si = {sizeof si}; PROCESS_INFORMATION pi = {};
+    if (!CreateProcessW(nullptr, &cl[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) return false;
+    WaitForSingleObject(pi.hProcess, INFINITE); DWORD code = 1; GetExitCodeProcess(pi.hProcess, &code); CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    return code == 0;
+}
+std::wstring installCuda() {                                                                       // returns an error text or empty
+    const std::wstring rt = g_dir + L"\\runtime", work = rt + L"\\cuda_download";
+    CreateDirectoryW(rt.c_str(), nullptr); CreateDirectoryW(work.c_str(), nullptr);
+    const std::wstring base = std::wstring(L"https://github.com/ggml-org/llama.cpp/releases/download/") + kLlamaTag + L"/";
+    struct Z { std::wstring remote, local, dir; unsigned long long bytes; };
+    const Z zs[] = {{std::wstring(L"llama-") + kLlamaTag + L"-bin-win-cuda-13.5-x64.zip", L"llama-cuda.zip", L"x_llama", kLlamaZipBytes},
+                    {L"cudart-llama-bin-win-cuda-13.5-x64.zip", L"cudart.zip", L"x_cudart", kCudartZipBytes}};
+    int n = 0;
+    for (const Z& z : zs) {
+        setupText(L"CUDA libraries, archive " + std::to_wstring(++n) + L" of 2");
+        std::wstring e = downloadFile(base + z.remote, work + L"\\" + z.local, z.bytes); if (!e.empty()) return e;
+    }
+    setupText(L"Unpacking the CUDA libraries...");
+    for (const Z& z : zs) if (!unzipTo(work + L"\\" + z.local, work + L"\\" + z.dir)) return L"Could not unpack " + z.local + L" (needs Windows 10 version 1803 or newer).";
+    const struct { const wchar_t* dll; const wchar_t* from; } items[] = {{L"ggml-cuda.dll", L"x_llama"}, {L"cudart64_13.dll", L"x_cudart"}, {L"cublas64_13.dll", L"x_cudart"}, {L"cublasLt64_13.dll", L"x_cudart"}};
+    for (auto& it : items) {
+        const std::wstring f = findFileRec(work + L"\\" + it.from, it.dll);
+        if (f.empty()) return std::wstring(it.dll) + L" is not in the downloaded archive.";
+        if (!MoveFileExW(f.c_str(), (rt + L"\\" + it.dll).c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) return L"Cannot write runtime\\" + std::wstring(it.dll) + L" (is the program folder writable?).";
+    }
+    removeTree(work);
+    return L"";
+}
+
+namespace {
+struct Setup { HWND wnd = nullptr, list = nullptr, bar = nullptr, status = nullptr, go = nullptr, close = nullptr; bool running = false; std::thread th; } S;
+enum { ID_SGO = 201, ID_SCLOSE };
+unsigned long long cudaBytes() { return kLlamaZipBytes + kCudartZipBytes; }
+std::wstring mb(unsigned long long b) { wchar_t t[40]; if (b >= (1ull << 30)) swprintf(t, 40, L"%.1f GB", b / 1073741824.0); else swprintf(t, 40, L"%d MB", (int)(b >> 20)); return t; }
+bool presetInstalled(int i) { return fileSizeOf(g_modelDir + L"\\" + kPresets[i].file) == kPresets[i].bytes; }
+void setupRows(bool keepChecks) {
+    bool chk[1 + kPresetCount] = {};
+    if (keepChecks) for (int i = 0; i < 1 + kPresetCount; i++) chk[i] = ListView_GetCheckState(S.list, i) != 0;
+    ListView_DeleteAllItems(S.list);
+    const int sel = (int)SendMessageW(g_combo, CB_GETCURSEL, 0, 0);
+    for (int i = 0; i < 1 + kPresetCount; i++) {
+        const bool cuda = i == 0, inst = cuda ? cudaInstalled() : presetInstalled(i - 1);
+        std::wstring name = cuda ? L"CUDA libraries (NVIDIA GPU runtime for the test)" : kPresets[i - 1].label;
+        LVITEMW it = {}; it.mask = LVIF_TEXT; it.iItem = i; it.pszText = &name[0]; ListView_InsertItem(S.list, &it);
+        std::wstring sz = mb(cuda ? cudaBytes() : kPresets[i - 1].bytes), st = inst ? L"installed" : L"missing";
+        ListView_SetItemText(S.list, i, 1, &sz[0]); ListView_SetItemText(S.list, i, 2, &st[0]);
+        const bool def = cuda ? true : (i - 1 == (sel >= 0 && sel < kPresetCount ? sel : 0));
+        ListView_SetCheckState(S.list, i, !inst && (keepChecks ? chk[i] : def));
+    }
+}
+void setupWorker(std::vector<int> pick) {
+    std::wstring err;
+    for (int i : pick) {
+        if (i == 0) err = installCuda();
+        else {
+            const Preset& p = kPresets[i - 1];
+            CreateDirectoryW(g_modelDir.c_str(), nullptr); setupText(std::wstring(L"Model ") + p.file);
+            err = downloadFile(p.url, g_modelDir + L"\\" + p.file, p.bytes);
+        }
+        if (!err.empty()) break;
+    }
+    { std::lock_guard<std::mutex> g(g_setupMx); g_setupResult = err; }
+    g_setupFinished = true;
+}
+LRESULT CALLBACK setupProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    switch (m) {
+    case WM_COMMAND:
+        if (LOWORD(wp) == ID_SGO && !S.running) {
+            std::vector<int> pick; unsigned long long need = 0;
+            for (int i = 0; i < 1 + kPresetCount; i++) { const bool inst = i == 0 ? cudaInstalled() : presetInstalled(i - 1); if (ListView_GetCheckState(S.list, i) && !inst) { pick.push_back(i); need += i == 0 ? cudaBytes() : kPresets[i - 1].bytes; } }
+            if (pick.empty()) { SetWindowTextW(S.status, L"Nothing is checked (or it is installed already)."); return 0; }
+            ULARGE_INTEGER freeB = {}, a = {}, b = {};
+            if (GetDiskFreeSpaceExW(g_dir.c_str(), &freeB, &a, &b) && freeB.QuadPart < need + (1ull << 30)) { SetWindowTextW(S.status, (L"Not enough free disk space: " + mb(need) + L" needed, " + mb(freeB.QuadPart) + L" free.").c_str()); return 0; }
+            S.running = true; g_dlCancel = false; g_setupFinished = false; g_dlDone = 0; g_dlTotal = 0;
+            SetWindowTextW(S.go, L"Working..."); EnableWindow(S.go, FALSE); SetWindowTextW(S.close, L"Cancel");
+            if (S.th.joinable()) S.th.join();
+            S.th = std::thread(setupWorker, pick);
+        } else if (LOWORD(wp) == ID_SCLOSE) { if (S.running) { g_dlCancel = true; SetWindowTextW(S.status, L"Cancelling..."); } else DestroyWindow(h); }
+        return 0;
+    case WM_TIMER:
+        if (S.running) {
+            const unsigned long long d = g_dlDone, t = g_dlTotal; std::wstring txt; { std::lock_guard<std::mutex> g(g_setupMx); txt = g_setupText; }
+            SendMessageW(S.bar, PBM_SETPOS, t ? (WPARAM)(d * 1000 / t) : 0, 0);
+            if (!g_setupFinished) { if (d || t) txt += L"   " + mb(d) + L" / " + mb(t); SetWindowTextW(S.status, txt.c_str()); }
+            else {
+                if (S.th.joinable()) S.th.join();
+                std::wstring err; { std::lock_guard<std::mutex> g(g_setupMx); err = g_setupResult; }
+                S.running = false; SendMessageW(S.bar, PBM_SETPOS, err.empty() ? 1000 : 0, 0);
+                SetWindowTextW(S.status, err.empty() ? L"Done." : err.c_str()); SetWindowTextW(S.go, L"Download selected"); EnableWindow(S.go, TRUE); SetWindowTextW(S.close, L"Close");
+                setupRows(false);
+            }
+        }
+        return 0;
+    case WM_CLOSE: if (S.running) { g_dlCancel = true; SetWindowTextW(S.status, L"Cancelling... close again when it stops."); return 0; } DestroyWindow(h); return 0;
+    case WM_DESTROY: KillTimer(h, 1); return 0;
+    }
+    return DefWindowProcW(h, m, wp, lp);
+}
+}  // namespace
+
+void showSetupDialog(bool first) {
+    static bool reg = false; HINSTANCE inst = GetModuleHandleW(nullptr);
+    if (!reg) {
+        INITCOMMONCONTROLSEX ic = {sizeof ic, ICC_LISTVIEW_CLASSES}; InitCommonControlsEx(&ic);
+        WNDCLASSW wc = {}; wc.lpfnWndProc = setupProc; wc.hInstance = inst; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); wc.lpszClassName = L"DopplersGpuTuneSetup"; wc.hIcon = (HICON)GetClassLongPtrW(g_wnd, GCLP_HICON);
+        RegisterClassW(&wc); reg = true;
+    }
+    const int W = 700, H = 360; RECT pr; GetWindowRect(g_wnd, &pr);
+    RECT r = {0, 0, W, H}; AdjustWindowRect(&r, WS_CAPTION | WS_SYSMENU, FALSE);
+    S.running = false;
+    S.wnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"DopplersGpuTuneSetup", first ? L"Welcome - download the files for the test" : L"Download the CUDA libraries and test models", WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                            pr.left + ((pr.right - pr.left) - (r.right - r.left)) / 2, pr.top + 80, r.right - r.left, r.bottom - r.top, g_wnd, nullptr, inst, nullptr);
+    if (!S.wnd) { setStatus(L"Cannot open the download window (error " + std::to_wstring(GetLastError()) + L")."); return; }
+    auto mk = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y, int w, int hgt, int id, DWORD ex = 0) {
+        HWND c = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, hgt, S.wnd, (HMENU)(INT_PTR)id, inst, nullptr); SendMessageW(c, WM_SETFONT, (WPARAM)g_font, TRUE); return c; };
+    mk(L"STATIC", first ? L"The test needs the NVIDIA CUDA libraries and a model. They are not part of the program's download: pick what to download now (the files go next to the program, into runtime\\ and models\\). You can also select your own .gguf with Browse."
+                        : L"The CUDA libraries go into runtime\\, the models into models\\ next to the program.", SS_LEFT, 14, 12, W - 28, 56, 0);
+    S.list = mk(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_TABSTOP, 14, 72, W - 28, 158, 10, WS_EX_CLIENTEDGE);
+    ListView_SetExtendedListViewStyle(S.list, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT);
+    const wchar_t* cols[] = {L"File", L"Size", L"State"}; const int cw[] = {440, 100, 100};
+    for (int i = 0; i < 3; i++) { LVCOLUMNW c = {}; c.mask = LVCF_TEXT | LVCF_WIDTH; c.pszText = (LPWSTR)cols[i]; c.cx = cw[i]; ListView_InsertColumn(S.list, i, &c); }
+    setupRows(false);
+    S.status = mk(L"STATIC", L"Untick what you do not need.", SS_LEFT | SS_ENDELLIPSIS, 14, 240, W - 28, 20, 0);
+    S.bar = mk(PROGRESS_CLASSW, L"", PBS_SMOOTH, 14, 266, W - 28, 20, 0); SendMessageW(S.bar, PBM_SETRANGE32, 0, 1000);
+    S.go = mk(L"BUTTON", L"Download selected", BS_DEFPUSHBUTTON | WS_TABSTOP, W - 270, 310, 150, 30, ID_SGO);
+    S.close = mk(L"BUTTON", first ? L"Skip" : L"Close", BS_PUSHBUTTON | WS_TABSTOP, W - 110, 310, 96, 30, ID_SCLOSE);
+    SetTimer(S.wnd, 1, 200, nullptr);
+    EnableWindow(g_wnd, FALSE);
+    MSG msg; while (IsWindow(S.wnd) && GetMessageW(&msg, nullptr, 0, 0) > 0) { if (!IsDialogMessageW(S.wnd, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); } }
+    if (S.th.joinable()) { g_dlCancel = true; S.th.join(); }
+    EnableWindow(g_wnd, TRUE); SetForegroundWindow(g_wnd);
+}
+
 LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     switch (m) {
     case WM_HSCROLL: if ((HWND)lp == g_slider) { SendMessageW(g_slider, TBM_SETPOS, TRUE, sliderValue()); updateLabel(); } return 0;
     case WM_COMMAND:
         if (LOWORD(wp) == ID_TEST && !g_busy) {
-            if (!modelReady()) { setStatus(L"The test model is not on the disk yet: select one and press Download model (or Browse... for your own .gguf)."); return 0; }
+            if (!cudaInstalled()) { setStatus(L"The CUDA libraries are not installed (without them the test would run on the CPU): press Download..."); return 0; }
+            if (!modelReady()) { setStatus(L"The test model is not on the disk yet: select one and press Download... (or Browse... for your own .gguf)."); return 0; }
             const bool apply = SendMessageW(g_apply, BM_GETCHECK, 0, 0) == BST_CHECKED;
             if (apply && !g_abWarned && afterburnerRunning()) {
                 g_abWarned = true;
@@ -413,26 +577,11 @@ LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             wchar_t file[MAX_PATH] = {}; OPENFILENAMEW o = {sizeof o}; o.hwndOwner = h; o.lpstrFilter = L"GGUF models\0*.gguf\0All files\0*.*\0"; o.lpstrFile = file; o.nMaxFile = MAX_PATH; o.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
             if (GetOpenFileNameW(&o)) { g_customModel = file; refreshCombo(); SendMessageW(g_combo, CB_SETCURSEL, kPresetCount, 0); saveIni(); updateDlButton(); refreshList(); }
         } else if (LOWORD(wp) == ID_DOWNLOAD) {
-            if (g_dlBusy) { g_dlCancel = true; return 0; }
-            const int i = (int)SendMessageW(g_combo, CB_GETCURSEL, 0, 0); if (i < 0 || i >= kPresetCount) return 0;
-            CreateDirectoryW(g_modelDir.c_str(), nullptr);
-            g_dlBusy = true; g_dlCancel = false; updateDlButton(); SendMessageW(g_prog, PBM_SETPOS, 0, 0);
-            setStatus(std::wstring(L"Downloading ") + kPresets[i].file + L" ...");
-            std::thread([i] { std::wstring e = downloadFile(kPresets[i].url, g_modelDir + L"\\" + kPresets[i].file, kPresets[i].bytes); PostMessageW(g_wnd, WM_DLDONE, 0, (LPARAM) new std::wstring(e)); }).detach();
+            showSetupDialog(false); refreshCombo(); updateDlButton(); refreshList();
+            setStatus(cudaInstalled() && modelReady() ? L"Ready. Move the slider and press TEST." : L"Something is still missing: press Download... to get the CUDA libraries and a test model.");
         }
         return 0;
     case WM_STATUS: { std::wstring* s = (std::wstring*)lp; if (g_busy) setStatus(*s); delete s; return 0; }
-    case WM_DLPROG: {
-        SendMessageW(g_prog, PBM_SETPOS, wp, 0);
-        const int i = (int)SendMessageW(g_combo, CB_GETCURSEL, 0, 0); wchar_t b[200];
-        if (i >= 0 && i < kPresetCount) { swprintf(b, 200, L"Downloading %ls:  %d MB of %d MB  (%d %%)", kPresets[i].file, (int)lp, (int)(kPresets[i].bytes >> 20), (int)(wp / 10)); setStatus(b); }
-        return 0;
-    }
-    case WM_DLDONE: {
-        std::wstring* e = (std::wstring*)lp; g_dlBusy = false; refreshCombo(); updateDlButton();
-        if (e->empty()) { SendMessageW(g_prog, PBM_SETPOS, 1000, 0); setStatus(L"Model downloaded. Move the slider and press TEST."); } else setStatus(*e);
-        delete e; return 0;
-    }
     case WM_DONE: {
         Result* r = (Result*)lp; g_busy = false; EnableWindow(g_test, TRUE);
         if (r->ok) {
@@ -444,7 +593,7 @@ LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     }
     case WM_SIZE: if (g_graph) layout(); return 0;
     case WM_GETMINMAXINFO: ((MINMAXINFO*)lp)->ptMinTrackSize = {1000, 700}; return 0;
-    case WM_CLOSE: if (g_busy) return 0; if (g_dlBusy) g_dlCancel = true; restoreOffset(true); DestroyWindow(h); return 0;
+    case WM_CLOSE: if (g_busy) return 0; restoreOffset(true); DestroyWindow(h); return 0;
     case WM_DESTROY: g_bench.unload(); PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(h, m, wp, lp);
@@ -480,7 +629,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     g_combo = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, ID_MODEL);
     g_dl = mk(L"BUTTON", L"Download model", BS_PUSHBUTTON | WS_TABSTOP, ID_DOWNLOAD);
     g_browse = mk(L"BUTTON", L"Browse...", BS_PUSHBUTTON | WS_TABSTOP, ID_BROWSE);
-    g_prog = mk(PROGRESS_CLASSW, L"", PBS_SMOOTH, ID_PROGRESS); SendMessageW(g_prog, PBM_SETRANGE32, 0, 1000);
     g_label = mk(L"STATIC", L"", SS_LEFT, ID_LABEL); SendMessageW(g_label, WM_SETFONT, (WPARAM)g_bold, TRUE);
     g_slider = mk(TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_AUTOTICKS | TBS_TOOLTIPS, ID_SLIDER);
     SendMessageW(g_slider, TBM_SETRANGE, TRUE, MAKELONG(-500, 750)); SendMessageW(g_slider, TBM_SETTICFREQ, 50, 0); SendMessageW(g_slider, TBM_SETPAGESIZE, 0, 50); SendMessageW(g_slider, TBM_SETLINESIZE, 0, 10);
@@ -495,8 +643,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     refreshCombo(); { int sel = GetPrivateProfileIntW(L"gputune", L"model", 0, g_ini.c_str()); const int count = kPresetCount + (g_customModel.empty() ? 0 : 1); SendMessageW(g_combo, CB_SETCURSEL, sel >= 0 && sel < count ? sel : 0, 0); }
     updateLabel(); updateDlButton(); refreshList(); layout();
     setStatus(modelReady() ? L"Ready. Tip: set MSI Afterburner's memory offset to 0 first, then move the slider here and press TEST."
-                           : L"First step: press Download model (the 4B model, 2.5 GB, is the usual test), then move the slider and press TEST.");
+                           : L"First step: press Download... (the CUDA libraries and the 4B test model), then move the slider and press TEST.");
     ShowWindow(g_wnd, show); UpdateWindow(g_wnd);
+    if (!cudaInstalled() || !modelReady()) { showSetupDialog(true); refreshCombo(); updateDlButton(); refreshList(); setStatus(cudaInstalled() && modelReady() ? L"Ready. Move the slider and press TEST." : L"Something is missing: press Download... to get the CUDA libraries and a test model."); }
     MSG msg; while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     return 0;
 }
